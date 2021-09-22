@@ -73,6 +73,8 @@ License: MIT
 	Papa.RemoteChunkSize = 1024 * 1024 * 5;	// 5 MB
 	Papa.DefaultDelimiter = ',';			// Used if not specified and detection fails
 
+	Papa.DefaultUtf16Threshold = 0.25;
+
 	// Exposed for testing and development only
 	Papa.Parser = Parser;
 	Papa.ParserHandle = ParserHandle;
@@ -244,7 +246,17 @@ License: MIT
 			streamer = new ReadableStreamStreamer(_config);
 		}
 		else if ((global.File && _input instanceof File) || _input instanceof Object)	// ...Safari. (see issue #106)
+		{
+			if (_config.tryGuessEncoding) {
+				guessEncoding(_input, _config, function(encoding) {
+					_config.encoding = encoding;
+					streamer = new FileStreamer(_config);
+					streamer.stream(_input);
+				});
+				return;
+			}
 			streamer = new FileStreamer(_config);
+		}
 
 		return streamer.stream(_input);
 	}
@@ -529,6 +541,9 @@ License: MIT
 
 			if (IS_PAPA_WORKER)
 			{
+				if (results && finishedIncludingPreview) {
+					reformatParsedCsv(results, this._config);
+				}
 				global.postMessage({
 					results: results,
 					workerId: Papa.WORKER_ID,
@@ -720,6 +735,25 @@ License: MIT
 		// FileReader is better than FileReaderSync (even in worker) - see http://stackoverflow.com/q/24708649/1048862
 		// But Firefox is a pill, too - see issue #76: https://github.com/mholt/PapaParse/issues/76
 		var usingAsyncReader = typeof FileReader !== 'undefined';	// Safari doesn't consider it a function - see issue #105
+
+		this.readByteArray = function(file, onByteArrayRead, onError)
+		{
+			this._input = file;
+			if (usingAsyncReader)
+			{
+				reader = new FileReader();		// Preferred method of reading files, even in workers
+				reader.onload = onByteArrayRead;
+				reader.onerror = onError;
+			}
+			else
+			{
+				reader = new FileReaderSync();	// Hack for running in a web worker in Firefox
+			}
+			var byteArray = reader.readAsArrayBuffer(file);
+			if (!usingAsyncReader) {
+				onByteArrayRead({ target: { result: byteArray } });
+			}
+		};
 
 		this.stream = function(file)
 		{
@@ -1153,7 +1187,7 @@ License: MIT
 		{
 			if (_results && _delimiterError)
 			{
-				addError('Delimiter', 'UndetectableDelimiter', 'Unable to auto-detect delimiting character; defaulted to \'' + Papa.DefaultDelimiter + '\'');
+				addError('Delimiter', 'UndetectableDelimiter', 'Unable to auto-detect delimiting character; defaulted to \'' + Papa.DefaultDelimiter + '\'', _results);
 				_delimiterError = false;
 			}
 
@@ -1262,9 +1296,9 @@ License: MIT
 				if (_config.header)
 				{
 					if (j > _fields.length)
-						addError('FieldMismatch', 'TooManyFields', 'Too many fields: expected ' + _fields.length + ' fields but parsed ' + j, _rowCounter + i);
+						addError('FieldMismatch', 'TooManyFields', 'Too many fields: expected ' + _fields.length + ' fields but parsed ' + j, _rowCounter + i, _results);
 					else if (j < _fields.length)
-						addError('FieldMismatch', 'TooFewFields', 'Too few fields: expected ' + _fields.length + ' fields but parsed ' + j, _rowCounter + i);
+						addError('FieldMismatch', 'TooFewFields', 'Too few fields: expected ' + _fields.length + ' fields but parsed ' + j, _rowCounter + i, _results);
 				}
 
 				return row;
@@ -1366,25 +1400,67 @@ License: MIT
 
 			return numWithN >= r.length / 2 ? '\r\n' : '\r';
 		}
-
-		function addError(type, code, msg, row)
-		{
-			var error = {
-				type: type,
-				code: code,
-				message: msg
-			};
-			if(row !== undefined) {
-				error.row = row;
-			}
-			_results.errors.push(error);
-		}
 	}
 
 	/** https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions */
 	function escapeRegExp(string)
 	{
 		return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+	}
+
+	function addError(type, code, msg, row, _results)
+	{
+		var error = {
+			type: type,
+			code: code,
+			message: msg
+		};
+		if(row !== undefined) {
+			error.row = row;
+		}
+		_results.errors.push(error);
+	}
+
+	function guessEncoding(inputFile, config, doneCallback)
+	{
+		var fileStreamer = new FileStreamer(config);
+		var utf16Threshold = config.utf16Threshold || Papa.DefaultUtf16Threshold;
+		fileStreamer.readByteArray(inputFile, function(event) {
+			// eslint-disable-next-line no-undef
+			var fileAsByteArray = new Uint8Array(event.target.result);
+			if (fileAsByteArray[0] === 0xef && fileAsByteArray[1] === 0xbb && fileAsByteArray[2] === 0xbf) {
+				return doneCallback('utf8');
+			}
+			if (fileAsByteArray[0] === 0xfe && fileAsByteArray[1] === 0xff) {
+				return doneCallback('utf-16be');
+			}
+			if (fileAsByteArray[0] === 0xff && fileAsByteArray[1] === 0xfe) {
+				return doneCallback('utf-16le');
+			}
+
+			var zeroBytesAtOddIndexes = 0;
+			var zeroBytesAtEvenIndexes = 0;
+			fileAsByteArray.forEach(function(byteValue, byteIndex) {
+				if (byteValue !== 0x00) {
+					return;
+				}
+				if (byteIndex % 2) {
+					zeroBytesAtOddIndexes += 1;
+					return;
+				}
+				zeroBytesAtEvenIndexes += 1;
+			});
+			var expectedNumberOfZeroBytes = fileAsByteArray.length * utf16Threshold;
+			if (zeroBytesAtEvenIndexes > expectedNumberOfZeroBytes) {
+				return doneCallback('utf-16be');
+			}
+			if (zeroBytesAtOddIndexes > expectedNumberOfZeroBytes) {
+				return doneCallback('utf-16le');
+			}
+			return doneCallback('utf8');
+		}, function() {
+			doneCallback('utf8');
+		});
 	}
 
 	/** The core parser implements speedy and correct CSV parsing */
@@ -1822,6 +1898,68 @@ License: MIT
 		throw new Error('Not implemented.');
 	}
 
+	function formatFieldName(columnName) {
+		return columnName.replace(/\s+/g, '').toLocaleLowerCase();
+	}
+
+	function reformatParsedCsv(parsedResult, config) {
+		if (!config.desiredFieldNames || !config.header) {
+			return;
+		}
+		// Map parsed fields to desired fields
+		var fieldsMapping = {};
+		var backwardFieldsMapping = {};
+		var parsedFormattedFields = parsedResult.meta.fields.reduce(function(result, parsedField) {
+			result[parsedField] = formatFieldName(parsedField);
+			return result;
+		}, {});
+		config.desiredFieldNames.forEach(function(desiredFieldConfig) {
+			var formattedSynonymField = '';
+			var matchedParsedField = null;
+			var i  = 0;
+			for (i = 0; i < desiredFieldConfig.synonymFields.length; i++) {
+				formattedSynonymField = formatFieldName(desiredFieldConfig.synonymFields[i]);
+				// eslint-disable-next-line no-loop-func
+				matchedParsedField = Object.keys(parsedFormattedFields).find(function(parsedField) {
+					return parsedFormattedFields[parsedField] === formattedSynonymField;
+				});
+				if (matchedParsedField) {
+					break;
+				}
+			}
+			fieldsMapping[desiredFieldConfig.desiredField] = matchedParsedField;
+			backwardFieldsMapping[matchedParsedField] = desiredFieldConfig.desiredField;
+		});
+		// Check if there are some parsed fields mapped to desired
+		if (!Object.keys(fieldsMapping).filter(function(desiredField) { return fieldsMapping[desiredField]; }).length) {
+			addError('BadFieldsNaming', '', 'There are no row names recognized', null, parsedResult);
+			parsedResult.meta.fields = [];
+			parsedResult.data = [];
+			return;
+		}
+		// Reconstruct meta fields array
+		var newFields = [];
+		for (var j = 0; j < parsedResult.meta.fields.length; j++) {
+			if (!backwardFieldsMapping[parsedResult.meta.fields[j]]) {
+				addError('UnknownField', '', 'Field ' + parsedResult.meta.fields[j] + ' cannot be recognized', null, parsedResult);
+				continue;
+			}
+			newFields.push(backwardFieldsMapping[parsedResult.meta.fields[j]]);
+		}
+		parsedResult.meta.fields = newFields;
+		// Reconstruct the parsed data
+		parsedResult.data = parsedResult.data.map(function(parsedRow) {
+			var newRow = {};
+			Object.keys(fieldsMapping).forEach(function(desiredField) {
+				if (!fieldsMapping[desiredField]) {
+					return;
+				}
+				newRow[desiredField] = parsedRow[fieldsMapping[desiredField]];
+			});
+			return newRow;
+		});
+	}
+
 	/** Callback when worker thread receives a message */
 	function workerThreadReceivedMessage(e)
 	{
@@ -1841,12 +1979,14 @@ License: MIT
 		else if ((global.File && msg.input instanceof File) || msg.input instanceof Object)	// thank you, Safari (see issue #106)
 		{
 			var results = Papa.parse(msg.input, msg.config);
-			if (results)
+			if (results) {
+				reformatParsedCsv(results, msg.config);
 				global.postMessage({
 					workerId: Papa.WORKER_ID,
 					results: results,
 					finished: true
 				});
+			}
 		}
 	}
 
